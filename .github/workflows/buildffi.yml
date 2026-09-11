@@ -173,10 +173,15 @@ jobs:
         run: |
           call "%VS%\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
 
-          rem Prefer NASM and ffi-prefix tools; do not force-strip PATH (cmd replace is fragile)
-          set "PATH=C:\Program Files\NASM;%CD%\ffi-prefix\bin;%PATH%"
+          rem Same as upstream win32 CI: drop standalone LLVM/CMake/Strawberry so VS clang wins
+          python ci\ffi\sanitize-path.py
+          if errorlevel 1 exit /b 1
+          set /p PATH=<_path.txt
+          del _path.txt
 
-          rem Upstream-proven Windows toolchain: VS LLVM clang + lld-link
+          rem x64 only: VS LLVM clang first, then NASM / libvpl
+          set "PATH=%VS%\VC\Tools\Llvm\x64\bin;C:\Program Files\NASM;%CD%\ffi-prefix\bin;%PATH%"
+
           set CC=ccache clang
           set CXX=ccache clang++
           set CC_LD=lld-link
@@ -188,8 +193,14 @@ jobs:
           set INCLUDE=%CD%\ffi-prefix\include;%INCLUDE%
           set LIB=%CD%\ffi-prefix\lib;%LIB%
 
+          where clang
           clang --version
+          echo clang must be VS Llvm\x64, NOT Program Files\LLVM
           pkg-config --exists --print-errors vpl
+          if errorlevel 1 exit /b 1
+
+          rem shared libmpv.dll + static deps (upstream uses static default_library)
+          python ci\ffi\patch-libmpv-shared.py
           if errorlevel 1 exit /b 1
 
           if exist build-ffi rmdir /s /q build-ffi
@@ -198,7 +209,7 @@ jobs:
             --prefix=%CD%\ffi-prefix ^
             --libdir=lib ^
             --wrap-mode=forcefallback ^
-            --default-library=shared ^
+            --default-library=static ^
             --buildtype=release ^
             -Db_vscrt=mt ^
             -Dlibmpv=true ^
@@ -224,6 +235,7 @@ jobs:
             -Dlcms2=disabled ^
             -Dlibavdevice=disabled ^
             -Dlibcurl=disabled ^
+            -Diconv=disabled ^
             -Dcuda-hwaccel=disabled ^
             -Dcuda-interop=disabled ^
             -Dd3d-hwaccel=disabled ^
@@ -251,21 +263,25 @@ jobs:
             -Dharfbuzz:freetype=enabled ^
             -Dxxhash:inline-all=true ^
             -Dxxhash:cli=false ^
+            -Dffmpeg:gpl=enabled ^
+            -Dffmpeg:tests=disabled ^
+            -Dffmpeg:programs=disabled ^
+            -Dffmpeg:sdl2=disabled ^
+            -Dffmpeg:network=enabled ^
             -Dffmpeg:libvpl=enabled ^
             -Dffmpeg:libdav1d=disabled ^
             -Dffmpeg:libaom=disabled ^
             -Dffmpeg:libjxl=disabled ^
             -Dffmpeg:ffnvcodec=disabled ^
             -Dffmpeg:vulkan=disabled ^
-            -Dffmpeg:programs=disabled ^
-            -Dffmpeg:tests=disabled ^
-            -Dffmpeg:network=enabled ^
-            -Dffmpeg:gpl=enabled ^
             -Dffmpeg:h264_qsv_decoder=enabled ^
             -Dffmpeg:aac_decoder=enabled ^
             -Dffmpeg:h264_decoder=disabled ^
             -Dffmpeg:hevc_decoder=disabled ^
+            -Dffmpeg:vvc_decoder=disabled ^
             -Dffmpeg:av1_decoder=disabled ^
+            -Dffmpeg:vp9_decoder=disabled ^
+            -Dffmpeg:vp8_decoder=disabled ^
             -Dffmpeg:hevc_qsv_decoder=disabled ^
             -Dffmpeg:av1_qsv_decoder=disabled ^
             -Dffmpeg:vp8_qsv_decoder=disabled ^
