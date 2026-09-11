@@ -41,6 +41,7 @@ jobs:
             subprojects/libvpl
             subprojects/shaderc_cmake
             subprojects/spirv-cross-src
+            subprojects/ffmpeg
           key: buildffi-x64-${{ steps.get_time.outputs.timestamp }}
           restore-keys: |
             buildffi-x64-
@@ -140,7 +141,8 @@ jobs:
           )
 
           rem Always rewrite .pc so restored cache works on a new runner workspace path
-          python -c "from pathlib import Path; p=Path('ffi-prefix').resolve().as_posix(); Path('ffi-prefix/lib/pkgconfig').mkdir(parents=True, exist_ok=True); Path('ffi-prefix/lib/pkgconfig/vpl.pc').write_text('prefix=%s\nexec_prefix=${prefix}\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: vpl\nDescription: Intel VPL\nVersion: 2.17.0\nLibs: -L${libdir} -lvpl\nCflags: -I${includedir}\n' % p, encoding='ascii')"
+          python ci\ffi\write-vpl-pc.py
+          if errorlevel 1 exit /b 1
 
           set PKG_CONFIG_PATH=%CD%\ffi-prefix\lib\pkgconfig
           pkg-config --exists --print-errors vpl
@@ -291,6 +293,14 @@ jobs:
           python ci\ffi\patch-libmpv-shared.py
           if errorlevel 1 exit /b 1
 
+          rem Pre-clone ffmpeg so we can fix qsv deps_any(libmfx|libvpl) before meson configures
+          if not exist subprojects\ffmpeg (
+            git clone --depth 1 --branch meson-8.1 --recurse-submodules https://gitlab.freedesktop.org/gstreamer/meson-ports/ffmpeg.git subprojects\ffmpeg
+            if errorlevel 1 exit /b 1
+          )
+          python ci\ffi\patch-ffmpeg-qsv-libvpl.py
+          if errorlevel 1 exit /b 1
+
           if exist build-ffi rmdir /s /q build-ffi
 
           meson setup build-ffi ^
@@ -357,6 +367,7 @@ jobs:
             -Dffmpeg:sdl2=disabled ^
             -Dffmpeg:network=enabled ^
             -Dffmpeg:libvpl=enabled ^
+            -Dffmpeg:libmfx=disabled ^
             -Dffmpeg:libdav1d=disabled ^
             -Dffmpeg:libaom=disabled ^
             -Dffmpeg:libjxl=disabled ^
@@ -418,6 +429,26 @@ jobs:
             -Dffmpeg:h264_vulkan_hwaccel=disabled
           if errorlevel 1 exit /b 1
 
+          rem Fail early if depgraph patch did not take effect
+          findstr /C:"#define CONFIG_H264_QSV_DECODER 1" build-ffi\subprojects\ffmpeg\config_components.h
+          if errorlevel 1 (
+            echo CONFIG_H264_QSV_DECODER is not 1
+            findstr /C:"CONFIG_H264_QSV" /C:"CONFIG_QSVDEC" build-ffi\subprojects\ffmpeg\config_components.h
+            findstr /C:"CONFIG_QSV" /C:"CONFIG_LIBVPL" build-ffi\subprojects\ffmpeg\config.h
+            exit /b 1
+          )
+          findstr /C:"#define CONFIG_QSV 1" build-ffi\subprojects\ffmpeg\config.h
+          if errorlevel 1 (
+            echo CONFIG_QSV is not 1
+            findstr /C:"CONFIG_QSV" build-ffi\subprojects\ffmpeg\config.h
+            exit /b 1
+          )
+          findstr /C:"#define CONFIG_LIBVPL 1" build-ffi\subprojects\ffmpeg\config.h
+          if errorlevel 1 (
+            echo CONFIG_LIBVPL is not 1
+            exit /b 1
+          )
+
           rem Meson target name is "mpv" (shared_library('mpv') -> mpv-2.dll)
           meson compile -C build-ffi mpv
           if errorlevel 1 exit /b 1
@@ -463,6 +494,16 @@ jobs:
             exit /b 1
           )
 
+          dumpbin /DEPENDENTS ffi-out\libmpv-2.dll | findstr /I /C:"libvpl.dll"
+          if errorlevel 1 (
+            echo libmpv-2.dll does not import libvpl.dll
+            dumpbin /DEPENDENTS ffi-out\libmpv-2.dll
+            exit /b 1
+          )
+
+          python ci\ffi\verify-libmpv-qsv.py ffi-out\libmpv-2.dll
+          if errorlevel 1 exit /b 1
+
           dir ffi-out
           ccache -s
 
@@ -489,4 +530,5 @@ jobs:
             subprojects/libvpl
             subprojects/shaderc_cmake
             subprojects/spirv-cross-src
+            subprojects/ffmpeg
           key: buildffi-x64-${{ steps.get_time.outputs.timestamp }}
