@@ -1,13 +1,8 @@
 name: lint
 
+# Manual only — push/PR auto runs disabled for this fork.
 on:
-  push:
-    branches:
-      - master
-      - ci
-      - 'release/**'
-  pull_request:
-    branches: [master]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}

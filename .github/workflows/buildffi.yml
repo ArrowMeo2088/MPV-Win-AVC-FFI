@@ -1,0 +1,118 @@
+name: buildffi
+
+# Manual cloud build of minimal libmpv-2.dll (MSVC x64). No push/PR auto trigger.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: buildffi-${{ github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  win-x64-msvc:
+    runs-on: windows-2025
+    env:
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_DIR: ${{ github.workspace }}\.ccache
+      CCACHE_MAXSIZE: 1G
+    steps:
+      - name: Disable autocrlf
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install meson ninja
+          winget install --accept-source-agreements --accept-package-agreements NASM.NASM Ccache.Ccache Kitware.CMake --disable-interactivity
+          echo "$env:LOCALAPPDATA\Microsoft\WinGet\Links" >> $env:GITHUB_PATH
+          echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
+          echo "C:\Program Files\CMake\bin" >> $env:GITHUB_PATH
+
+      - name: Install pkgconf
+        shell: pwsh
+        run: |
+          python -m pip install pkgconf
+          # Fallback: meson ships pkg-config discovery via pkgconf if on PATH
+          Get-Command pkgconf -ErrorAction SilentlyContinue
+          Get-Command pkg-config -ErrorAction SilentlyContinue
+
+      - name: Update Meson WrapDB (harfbuzz stack for libass)
+        shell: pwsh
+        run: |
+          meson wrap update-db
+          meson wrap install expat
+          meson wrap install harfbuzz
+          meson wrap install libpng
+          meson wrap install zlib
+          meson wrap install freetype2
+          meson wrap install fribidi
+
+      - name: Find Visual Studio (MSVC)
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { throw "Could not find a Visual Studio installation with MSVC" }
+          "VS=$vsPath" | Tee-Object -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build FFI libmpv (MSVC)
+        id: build
+        shell: pwsh
+        run: |
+          $env:PATH = ($env:PATH -split ';' | Where-Object {
+            $_ -ne 'C:\Program Files\LLVM\bin' -and
+            $_ -ne 'C:\Strawberry\c\bin'
+          }) -join ';'
+          $env:PATH = "C:\Program Files\NASM;C:\Program Files\CMake\bin;$env:PATH"
+          Import-Module "$env:VS\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+          Enter-VsDevShell -VsInstallPath $env:VS -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64"
+          # Force MSVC, not clang
+          $env:CC = "cl"
+          $env:CXX = "cl"
+          Remove-Item Env:CC_LD -ErrorAction SilentlyContinue
+          Remove-Item Env:CXX_LD -ErrorAction SilentlyContinue
+          ./ci/build-win32-ffi.ps1
+
+      - name: Print meson log on failure
+        if: ${{ failure() && steps.build.outcome == 'failure' }}
+        shell: pwsh
+        run: |
+          $log = Get-ChildItem -Recurse -Filter "meson-log.txt" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match 'build-ffi' } |
+            Select-Object -First 1
+          if ($log) { Get-Content $log.FullName -Tail 200 }
+
+      - name: Verify exports
+        shell: pwsh
+        run: |
+          Import-Module "$env:VS\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+          Enter-VsDevShell -VsInstallPath $env:VS -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64"
+          $dll = Join-Path $PWD "ffi-out\libmpv-2.dll"
+          if (-not (Test-Path $dll)) { throw "Missing $dll" }
+          $exports = & dumpbin.exe /EXPORTS $dll | Out-String
+          foreach ($sym in @('mpv_create','mpv_initialize','mpv_command','mpv_set_property','mpv_get_property','mpv_wait_event','mpv_terminate_destroy')) {
+            if ($exports -notmatch [regex]::Escape($sym)) {
+              throw "Missing export: $sym"
+            }
+            Write-Host "OK export: $sym"
+          }
+
+      - name: Artifact name
+        id: artifact
+        shell: pwsh
+        run: |
+          $name = "libmpv-2-win-x64-msvc-${{ github.run_id }}"
+          "name=$name" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: |
+            ffi-out/*
+            !ffi-out/*.pdb
+          if-no-files-found: error

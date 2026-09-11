@@ -1,5 +1,6 @@
 name: comment
 
+# Kept for legacy full `build` workflow; day-to-day FFI builds use `buildffi`.
 on:
   workflow_run:
     workflows: [build]
