@@ -409,8 +409,16 @@ jobs:
             -Dffmpeg:h264_vulkan_hwaccel=disabled
           if errorlevel 1 exit /b 1
 
-          meson compile -C build-ffi libmpv
+          rem Meson target name is "mpv" (shared_library('mpv')); variable is libmpv
+          meson compile -C build-ffi mpv
           if errorlevel 1 exit /b 1
+          meson introspect build-ffi --targets > build-ffi\targets.json
+          findstr /C:"\"name\": \"mpv\"" build-ffi\targets.json
+          if errorlevel 1 (
+            echo mpv target missing from introspect
+            type build-ffi\targets.json
+            exit /b 1
+          )
 
       - name: Print meson log on failure
         if: ${{ failure() && steps.build.outcome == 'failure' }}
