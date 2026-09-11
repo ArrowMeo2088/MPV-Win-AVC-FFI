@@ -252,6 +252,15 @@ jobs:
           pkg-config --exists --print-errors spirv-cross-c-shared
           if errorlevel 1 exit /b 1
           pkg-config --cflags --libs spirv-cross-c-shared
+          if exist ffi-prefix\include\spirv_cross\spirv_cross_c.h (
+            dir ffi-prefix\include\spirv_cross\spirv_cross_c.h
+          ) else if exist ffi-prefix\include\spirv_cross_c.h (
+            dir ffi-prefix\include\spirv_cross_c.h
+          ) else (
+            echo spirv_cross_c.h missing after install
+            dir /s /b ffi-prefix\include\*spirv*
+            exit /b 1
+          )
 
       - name: Meson setup and compile libmpv
         id: build
@@ -409,16 +418,9 @@ jobs:
             -Dffmpeg:h264_vulkan_hwaccel=disabled
           if errorlevel 1 exit /b 1
 
-          rem Meson target name is "mpv" (shared_library('mpv')); variable is libmpv
+          rem Meson target name is "mpv" (shared_library('mpv') -> mpv-2.dll)
           meson compile -C build-ffi mpv
           if errorlevel 1 exit /b 1
-          meson introspect build-ffi --targets > build-ffi\targets.json
-          findstr /C:"\"name\": \"mpv\"" build-ffi\targets.json
-          if errorlevel 1 (
-            echo mpv target missing from introspect
-            type build-ffi\targets.json
-            exit /b 1
-          )
 
       - name: Print meson log on failure
         if: ${{ failure() && steps.build.outcome == 'failure' }}
