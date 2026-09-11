@@ -11,7 +11,15 @@ GitHub Actions → buildffi → Run workflow
 Workflow file: `.github/workflows/buildffi.yml`  
 Build script: `ci/build-win32-ffi.ps1`  
 
+Toolchain: **VS DevShell x64 + clang/lld**（与上游 `win32` CI 相同的 MSVC ABI；纯 `cl` 在 meson-ports FFmpeg 上不可靠）。
+
 Push/PR auto builds for the legacy full matrix (`build.yml`, `lint.yml`, …) are **disabled**; those workflows are `workflow_dispatch` only.
+
+### Cache
+
+Actions 缓存：`.ccache`、`ffi-prefix`（libvpl）、`subprojects/libvpl`、`subprojects/shaderc_cmake`。
+
+依赖：`pkgconfiglite`（真实 `pkg-config.exe`）、NASM、ccache、meson、ninja。
 
 ## Runtime contract (mpv-kernel)
 

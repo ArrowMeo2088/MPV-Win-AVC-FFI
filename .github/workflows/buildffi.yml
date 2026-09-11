@@ -1,6 +1,7 @@
 name: buildffi
 
-# Manual cloud build of minimal libmpv-2.dll (MSVC x64). No push/PR auto trigger.
+# Manual cloud build of minimal libmpv-2.dll (VS/MSVC ABI + clang, x64).
+# No push/PR auto trigger.
 on:
   workflow_dispatch:
 
@@ -12,9 +13,15 @@ jobs:
   win-x64-msvc:
     runs-on: windows-2025
     env:
+      CC: ccache clang
+      CXX: ccache clang++
+      CC_LD: lld-link
+      CXX_LD: lld-link
+      WINDRES: llvm-rc
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_DIR: ${{ github.workspace }}\.ccache
-      CCACHE_MAXSIZE: 1G
+      CCACHE_MAXSIZE: 2G
+      CCACHE_COMPILERCHECK: content
     steps:
       - name: Disable autocrlf
         run: |
@@ -23,23 +30,41 @@ jobs:
 
       - uses: actions/checkout@v7
 
+      - name: Get time
+        id: get_time
+        shell: pwsh
+        run: |
+          "timestamp=$((Get-Date).Ticks)" >> $env:GITHUB_OUTPUT
+
+      - name: Restore caches
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            .ccache
+            ffi-prefix
+            subprojects/libvpl
+            subprojects/shaderc_cmake
+          key: buildffi-x64-${{ steps.get_time.outputs.timestamp }}
+          restore-keys: |
+            buildffi-x64-
+
       - name: Install dependencies
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
           python -m pip install meson ninja
-          winget install --accept-source-agreements --accept-package-agreements NASM.NASM Ccache.Ccache Kitware.CMake --disable-interactivity
+          winget install --accept-source-agreements --accept-package-agreements NASM.NASM Ccache.Ccache --disable-interactivity
+          # Real pkg-config binary required by meson-ports FFmpeg (pip pkgconf is not enough)
+          choco install pkgconfiglite -y --no-progress
           echo "$env:LOCALAPPDATA\Microsoft\WinGet\Links" >> $env:GITHUB_PATH
           echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
-          echo "C:\Program Files\CMake\bin" >> $env:GITHUB_PATH
 
-      - name: Install pkgconf
+      - name: Verify pkg-config
         shell: pwsh
         run: |
-          python -m pip install pkgconf
-          # Fallback: meson ships pkg-config discovery via pkgconf if on PATH
-          Get-Command pkgconf -ErrorAction SilentlyContinue
-          Get-Command pkg-config -ErrorAction SilentlyContinue
+          $pc = Get-Command pkg-config -ErrorAction Stop
+          Write-Host "pkg-config: $($pc.Source)"
+          pkg-config --version
 
       - name: Update Meson WrapDB (harfbuzz stack for libass)
         shell: pwsh
@@ -52,7 +77,7 @@ jobs:
           meson wrap install freetype2
           meson wrap install fribidi
 
-      - name: Find Visual Studio (MSVC)
+      - name: Find Visual Studio
         shell: pwsh
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -60,22 +85,27 @@ jobs:
           if (-not $vsPath) { throw "Could not find a Visual Studio installation with MSVC" }
           "VS=$vsPath" | Tee-Object -FilePath $env:GITHUB_ENV -Append
 
-      - name: Build FFI libmpv (MSVC)
+      - name: Build FFI libmpv
         id: build
         shell: pwsh
         run: |
+          # Match upstream win32 CI: drop conflicting toolchains, keep VS LLVM clang
           $env:PATH = ($env:PATH -split ';' | Where-Object {
             $_ -ne 'C:\Program Files\LLVM\bin' -and
+            $_ -ne 'C:\Program Files\CMake\bin' -and
             $_ -ne 'C:\Strawberry\c\bin'
           }) -join ';'
-          $env:PATH = "C:\Program Files\NASM;C:\Program Files\CMake\bin;$env:PATH"
+          $env:PATH = "C:\Program Files\NASM;$env:PATH"
           Import-Module "$env:VS\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
           Enter-VsDevShell -VsInstallPath $env:VS -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64"
-          # Force MSVC, not clang
-          $env:CC = "cl"
-          $env:CXX = "cl"
-          Remove-Item Env:CC_LD -ErrorAction SilentlyContinue
-          Remove-Item Env:CXX_LD -ErrorAction SilentlyContinue
+          # Job-level CC/CXX/CC_LD already set; reaffirm after DevShell
+          $env:CC = "ccache clang"
+          $env:CXX = "ccache clang++"
+          $env:CC_LD = "lld-link"
+          $env:CXX_LD = "lld-link"
+          $env:WINDRES = "llvm-rc"
+          clang --version
+          pkg-config --version
           ./ci/build-win32-ffi.ps1
 
       - name: Print meson log on failure
@@ -85,7 +115,10 @@ jobs:
           $log = Get-ChildItem -Recurse -Filter "meson-log.txt" -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -match 'build-ffi' } |
             Select-Object -First 1
-          if ($log) { Get-Content $log.FullName -Tail 200 }
+          if ($log) {
+            Write-Host "==== meson-log.txt (tail) ===="
+            Get-Content $log.FullName -Tail 250
+          }
 
       - name: Verify exports
         shell: pwsh
@@ -100,6 +133,9 @@ jobs:
               throw "Missing export: $sym"
             }
             Write-Host "OK export: $sym"
+          }
+          if (Get-Command ccache -ErrorAction SilentlyContinue) {
+            ccache -s
           }
 
       - name: Artifact name
@@ -116,3 +152,14 @@ jobs:
             ffi-out/*
             !ffi-out/*.pdb
           if-no-files-found: error
+
+      - name: Save caches
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            .ccache
+            ffi-prefix
+            subprojects/libvpl
+            subprojects/shaderc_cmake
+          key: buildffi-x64-${{ steps.get_time.outputs.timestamp }}

@@ -1,27 +1,22 @@
-# Minimal Windows MSVC build for libmpv FFI (Bili.Net / mpv-kernel).
-# Intended for GitHub Actions only — do not run as a local day-to-day build.
+# Minimal Windows libmpv FFI build (Bili.Net / mpv-kernel).
+# GitHub Actions only. Uses VS DevShell + clang/lld (MSVC ABI), same as upstream win32 CI.
 #
-# Capabilities kept:
-#   - Intel QSV H.264 hard decode via FFmpeg h264_qsv + libvpl (no soft h264)
-#   - AAC soft decode
-#   - HTTP(S) Range streaming
-#   - DASH-style A/V via separate demux + mpv audio-file (mov/mpegts/dash)
-#   - vo=gpu + d3d11 render path (libplacebo)
-#
-# Explicitly disabled: HEVC/AV1/VP9 soft+hard, NVDEC/CUDA, AMF, D3D11VA/DXVA2,
-# Vulkan video, Lua/JS, cplayer, ass, dav1d/aom/jxl, etc.
+# Kept: Intel QSV H.264 (FFmpeg h264_qsv + libvpl), AAC soft, HTTP(S) Range,
+#       DASH A/V via audio-file, vo=gpu + d3d11.
+# Dropped: soft h264, HEVC/AV1/VP9, NVDEC/CUDA/AMF/D3D11VA, Vulkan, lua/js, cplayer, ...
 
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $true
 Set-StrictMode -Version Latest
 
-$root = Resolve-Path .
+$root = (Resolve-Path .).Path
 $subprojects = Join-Path $root "subprojects"
 $prefix = Join-Path $root "ffi-prefix"
 $artifactDir = Join-Path $root "ffi-out"
 $buildDir = Join-Path $root "build-ffi"
+$pkgConfigDir = Join-Path $prefix "lib\pkgconfig"
 
-New-Item -ItemType Directory -Force -Path $subprojects, $prefix, $artifactDir | Out-Null
+New-Item -ItemType Directory -Force -Path $subprojects, $prefix, $artifactDir, $pkgConfigDir | Out-Null
 
 function Invoke-Native([string]$File, [string[]]$ArgList) {
     Write-Host "==> $File $($ArgList -join ' ')"
@@ -31,14 +26,50 @@ function Invoke-Native([string]$File, [string[]]$ArgList) {
     }
 }
 
+function Ensure-PkgConfig {
+    $cmd = Get-Command pkg-config -ErrorAction SilentlyContinue
+    if (-not $cmd) {
+        throw "pkg-config not found on PATH. Install pkgconfiglite (choco) in the workflow."
+    }
+    Write-Host "pkg-config: $($cmd.Source)"
+    Invoke-Native pkg-config @("--version")
+}
+
+function Write-VplPc {
+    param([string]$PrefixPath, [string]$OutDir)
+    $pc = @"
+prefix=$($PrefixPath -replace '\\','/')
+exec_prefix=`${prefix}
+libdir=`${prefix}/lib
+includedir=`${prefix}/include
+
+Name: vpl
+Description: Intel(R) Video Processing Library
+Version: 2.17.0
+Libs: -L`${libdir} -lvpl
+Cflags: -I`${includedir}
+"@
+    $dest = Join-Path $OutDir "vpl.pc"
+    Set-Content -Path $dest -Value $pc -Encoding ascii
+    Write-Host "Wrote $dest"
+}
+
+Ensure-PkgConfig
+
 # --- oneVPL dispatcher (libvpl) ---
 $vplSrc = Join-Path $subprojects "libvpl"
 $vplBuild = Join-Path $subprojects "libvpl-build"
+$vplDll = Join-Path $prefix "bin\libvpl.dll"
+$vplPc = Join-Path $pkgConfigDir "vpl.pc"
+
 if (-not (Test-Path $vplSrc)) {
     Invoke-Native git @("clone", "--depth", "1", "--branch", "v2.17.0", "https://github.com/intel/libvpl.git", $vplSrc)
 }
-if (-not (Test-Path (Join-Path $prefix "lib\pkgconfig\vpl.pc")) -and
-    -not (Test-Path (Join-Path $prefix "lib\pkgconfig\libvpl.pc"))) {
+
+if (-not (Test-Path $vplDll)) {
+    if (Test-Path $vplBuild) {
+        Remove-Item -Recurse -Force $vplBuild
+    }
     New-Item -ItemType Directory -Force -Path $vplBuild | Out-Null
     Invoke-Native cmake @(
         "-S", $vplSrc,
@@ -47,6 +78,7 @@ if (-not (Test-Path (Join-Path $prefix "lib\pkgconfig\vpl.pc")) -and
         "-DCMAKE_BUILD_TYPE=Release",
         "-DCMAKE_INSTALL_PREFIX=$prefix",
         "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",
+        "-DCMAKE_POLICY_DEFAULT_CMP0091=NEW",
         "-DBUILD_SHARED_LIBS=ON",
         "-DBUILD_TOOLS=OFF",
         "-DBUILD_EXAMPLES=OFF",
@@ -56,17 +88,27 @@ if (-not (Test-Path (Join-Path $prefix "lib\pkgconfig\vpl.pc")) -and
     Invoke-Native cmake @("--install", $vplBuild, "--config", "Release")
 }
 
+if (-not (Test-Path $vplPc)) {
+    Write-VplPc -PrefixPath $prefix -OutDir $pkgConfigDir
+}
+
+# Prefer forward-slash PKG_CONFIG_PATH for pkgconfiglite on Windows
+$env:PKG_CONFIG_PATH = (@(
+    ($pkgConfigDir -replace '\\', '/'),
+    ((Join-Path $prefix "lib64\pkgconfig") -replace '\\', '/'),
+    ((Join-Path $prefix "share\pkgconfig") -replace '\\', '/')
+) -join ';')
 $env:CMAKE_PREFIX_PATH = $prefix
-$env:PKG_CONFIG_PATH = @(
-    (Join-Path $prefix "lib\pkgconfig"),
-    (Join-Path $prefix "lib64\pkgconfig"),
-    (Join-Path $prefix "share\pkgconfig")
-) -join ";"
 $env:PATH = "$(Join-Path $prefix 'bin');$env:PATH"
 $env:INCLUDE = "$(Join-Path $prefix 'include');$env:INCLUDE"
 $env:LIB = "$(Join-Path $prefix 'lib');$(Join-Path $prefix 'lib64');$env:LIB"
 
-# --- shaderc wrap (needed by libplacebo / vo=gpu) ---
+Write-Host "PKG_CONFIG_PATH=$env:PKG_CONFIG_PATH"
+Invoke-Native pkg-config @("--exists", "--print-errors", "vpl")
+Write-Host "vpl cflags: $(pkg-config --cflags vpl)"
+Write-Host "vpl libs: $(pkg-config --libs vpl)"
+
+# --- shaderc wrap (libplacebo / vo=gpu) ---
 if (-not (Test-Path "$subprojects/shaderc_cmake")) {
     Invoke-Native git @("clone", "--depth", "1", "https://github.com/google/shaderc", "$subprojects/shaderc_cmake")
     Set-Content -Path "$subprojects/shaderc_cmake/p.diff" -Value @'
@@ -164,7 +206,6 @@ $projects = @(
         )
     },
     @{
-        # mpv still hard-depends on libass for OSD; Bili danmaku is separate.
         Path = "$subprojects/libass.wrap"
         URL = "https://github.com/libass/libass"
         Revision = "master"
@@ -200,9 +241,7 @@ clone-recursive = true
     Set-Content -Path $project.Path -Value $content
 }
 
-# FFmpeg whitelist / blacklist (meson-ports feature options)
 $ffmpegArgs = @(
-    # External deps
     "-Dffmpeg:libvpl=enabled",
     "-Dffmpeg:libdav1d=disabled",
     "-Dffmpeg:libaom=disabled",
@@ -214,7 +253,6 @@ $ffmpegArgs = @(
     "-Dffmpeg:network=enabled",
     "-Dffmpeg:gpl=enabled",
 
-    # Decoders: only QSV AVC + AAC soft
     "-Dffmpeg:h264_qsv_decoder=enabled",
     "-Dffmpeg:aac_decoder=enabled",
     "-Dffmpeg:h264_decoder=disabled",
@@ -233,21 +271,18 @@ $ffmpegArgs = @(
     "-Dffmpeg:libdav1d_decoder=disabled",
     "-Dffmpeg:libaom_av1_decoder=disabled",
 
-    # Encoders off
     "-Dffmpeg:h264_qsv_encoder=disabled",
     "-Dffmpeg:hevc_qsv_encoder=disabled",
     "-Dffmpeg:av1_qsv_encoder=disabled",
     "-Dffmpeg:h264_nvenc_encoder=disabled",
     "-Dffmpeg:h264_amf_encoder=disabled",
 
-    # Parsers / BSF needed for MP4/fMP4/HLS-style annex-B
     "-Dffmpeg:h264_parser=enabled",
     "-Dffmpeg:aac_parser=enabled",
     "-Dffmpeg:h264_mp4toannexb_bsf=enabled",
     "-Dffmpeg:aac_adtstoasc_bsf=enabled",
     "-Dffmpeg:extract_extradata_bsf=enabled",
 
-    # Demux / protocols for Bilibili HTTP Range + DASH segments
     "-Dffmpeg:mov_demuxer=enabled",
     "-Dffmpeg:mpegts_demuxer=enabled",
     "-Dffmpeg:dash_demuxer=enabled",
@@ -260,7 +295,6 @@ $ffmpegArgs = @(
     "-Dffmpeg:tls_protocol=enabled",
     "-Dffmpeg:crypto_protocol=enabled",
 
-    # Minimal filters for mpv lavfi pipeline / QSV system-memory path
     "-Dffmpeg:aresample_filter=enabled",
     "-Dffmpeg:aformat_filter=enabled",
     "-Dffmpeg:format_filter=enabled",
@@ -269,7 +303,6 @@ $ffmpegArgs = @(
     "-Dffmpeg:hwupload_filter=enabled",
     "-Dffmpeg:hwmap_filter=enabled",
 
-    # Disable competing H.264 hwaccels (QSV decoder path only)
     "-Dffmpeg:h264_d3d11va_hwaccel=disabled",
     "-Dffmpeg:h264_d3d11va2_hwaccel=disabled",
     "-Dffmpeg:h264_d3d12va_hwaccel=disabled",
@@ -345,28 +378,24 @@ $mesonSetup = @(
 Invoke-Native meson $mesonSetup
 Invoke-Native meson @("compile", "-C", $buildDir, "libmpv")
 
-# Locate shared libmpv output
 $candidates = @(
     Get-ChildItem -Path $buildDir -Recurse -Filter "mpv-*.dll" -ErrorAction SilentlyContinue
     Get-ChildItem -Path $buildDir -Recurse -Filter "mpv.dll" -ErrorAction SilentlyContinue
     Get-ChildItem -Path $buildDir -Recurse -Filter "libmpv*.dll" -ErrorAction SilentlyContinue
 ) | Where-Object { $_ -ne $null }
 
-if (-not $candidates -or $candidates.Count -eq 0) {
+if (-not $candidates -or @($candidates).Count -eq 0) {
     throw "libmpv DLL not found under $buildDir"
 }
 
-$builtDll = $candidates | Sort-Object FullName | Select-Object -First 1
+$builtDll = @($candidates) | Sort-Object FullName | Select-Object -First 1
 Write-Host "Built DLL: $($builtDll.FullName)"
 
-$outDll = Join-Path $artifactDir "libmpv-2.dll"
-Copy-Item -Force $builtDll.FullName $outDll
+Copy-Item -Force $builtDll.FullName (Join-Path $artifactDir "libmpv-2.dll")
 
-# Bundle oneVPL dispatcher DLL(s)
-Get-ChildItem -Path $prefix -Recurse -Include "libvpl.dll", "vpl.dll", "libmfx.dll" -ErrorAction SilentlyContinue |
+Get-ChildItem -Path $prefix -Recurse -Include "libvpl.dll", "vpl.dll" -ErrorAction SilentlyContinue |
     ForEach-Object { Copy-Item -Force $_.FullName (Join-Path $artifactDir $_.Name) }
 
-# Drop PDBs from artifact tree if any were copied
 Get-ChildItem -Path $artifactDir -Filter "*.pdb" -ErrorAction SilentlyContinue | Remove-Item -Force
 
 Write-Host "FFI artifacts:"
