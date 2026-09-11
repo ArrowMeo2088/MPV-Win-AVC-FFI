@@ -280,8 +280,24 @@ jobs:
 
           set PKG_CONFIG_PATH=%CD%\ffi-prefix\lib\pkgconfig
           set CMAKE_PREFIX_PATH=%CD%\ffi-prefix
-          set INCLUDE=%CD%\ffi-prefix\include;%INCLUDE%
+          set INCLUDE=%CD%\ffi-prefix\include;%CD%\ffi-prefix\include\vpl;%INCLUDE%
           set LIB=%CD%\ffi-prefix\lib;%LIB%
+
+          rem clang ignores MSVC INCLUDE=; bake vpl headers into every compile
+          rem libvpl installs mfxvideo.h under include/vpl/, FFmpeg includes <mfxvideo.h>
+          set "CFLAGS=-I%CD%\ffi-prefix\include -I%CD%\ffi-prefix\include\vpl -DMFX_DEPRECATED_OFF"
+          set "CXXFLAGS=-I%CD%\ffi-prefix\include -I%CD%\ffi-prefix\include\vpl -DMFX_DEPRECATED_OFF"
+          set "CPPFLAGS=-I%CD%\ffi-prefix\include -I%CD%\ffi-prefix\include\vpl -DMFX_DEPRECATED_OFF"
+          if exist ffi-prefix\include\vpl\mfxvideo.h (
+            copy /Y ffi-prefix\include\vpl\mfxvideo.h ffi-prefix\include\mfxvideo.h >nul
+            copy /Y ffi-prefix\include\vpl\mfxdispatcher.h ffi-prefix\include\mfxdispatcher.h >nul 2>nul
+            copy /Y ffi-prefix\include\vpl\mfx*.h ffi-prefix\include\ >nul 2>nul
+          )
+          if not exist ffi-prefix\include\mfxvideo.h (
+            echo mfxvideo.h missing under ffi-prefix\include
+            dir /s /b ffi-prefix\include\*mfx*
+            exit /b 1
+          )
 
           where clang
           clang --version
