@@ -173,14 +173,8 @@ jobs:
         run: |
           call "%VS%\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
 
-          rem Same as upstream win32 CI: drop standalone LLVM/CMake/Strawberry so VS clang wins
-          python ci\ffi\sanitize-path.py
-          if errorlevel 1 exit /b 1
-          set /p PATH=<_path.txt
-          del _path.txt
-
-          rem x64 only: VS LLVM clang first, then NASM / libvpl
-          set "PATH=%VS%\VC\Tools\Llvm\x64\bin;C:\Program Files\NASM;%CD%\ffi-prefix\bin;%PATH%"
+          rem x64 only: put VS LLVM clang BEFORE standalone LLVM; keep full PATH intact
+          set "PATH=%SystemRoot%\System32;%SystemRoot%;%VS%\VC\Tools\Llvm\x64\bin;C:\Program Files\NASM;%CD%\ffi-prefix\bin;%ProgramData%\chocolatey\bin;%LOCALAPPDATA%\Microsoft\WinGet\Links;%PATH%"
 
           set CC=ccache clang
           set CXX=ccache clang++
@@ -195,7 +189,7 @@ jobs:
 
           where clang
           clang --version
-          echo clang must be VS Llvm\x64, NOT Program Files\LLVM
+          where pkg-config
           pkg-config --exists --print-errors vpl
           if errorlevel 1 exit /b 1
 
