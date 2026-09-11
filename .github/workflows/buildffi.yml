@@ -40,6 +40,7 @@ jobs:
             ffi-prefix
             subprojects/libvpl
             subprojects/shaderc_cmake
+            subprojects/spirv-cross-src
           key: buildffi-x64-${{ steps.get_time.outputs.timestamp }}
           restore-keys: |
             buildffi-x64-
@@ -76,11 +77,8 @@ jobs:
           if not exist ffi-prefix mkdir ffi-prefix
           if not exist ffi-prefix\lib\pkgconfig mkdir ffi-prefix\lib\pkgconfig
           if not exist ffi-out mkdir ffi-out
-          if not exist subprojects\shaderc mkdir subprojects\shaderc
-          if not exist subprojects\spirv-cross-c-shared mkdir subprojects\spirv-cross-c-shared
 
-          copy /Y ci\ffi\shaderc.meson.build subprojects\shaderc\meson.build
-          copy /Y ci\ffi\spirv-cross.meson.build subprojects\spirv-cross-c-shared\meson.build
+          rem shaderc + spirv-cross are prebuilt with MSVC cl into ffi-prefix (not meson cmake wraps)
 
           > subprojects\ffmpeg.wrap echo [wrap-git]
           >> subprojects\ffmpeg.wrap echo url = https://gitlab.freedesktop.org/gstreamer/meson-ports/ffmpeg.git
@@ -102,13 +100,6 @@ jobs:
           >> subprojects\libplacebo.wrap echo revision = master
           >> subprojects\libplacebo.wrap echo depth = 1
           >> subprojects\libplacebo.wrap echo clone-recursive = true
-
-          > subprojects\spirv-cross.wrap echo [wrap-git]
-          >> subprojects\spirv-cross.wrap echo url = https://github.com/KhronosGroup/SPIRV-Cross
-          >> subprojects\spirv-cross.wrap echo revision = main
-          >> subprojects\spirv-cross.wrap echo depth = 1
-          >> subprojects\spirv-cross.wrap echo clone-recursive = true
-          >> subprojects\spirv-cross.wrap echo method = cmake
 
           meson wrap update-db
           meson wrap install expat
@@ -148,9 +139,8 @@ jobs:
             if errorlevel 1 exit /b 1
           )
 
-          if not exist ffi-prefix\lib\pkgconfig\vpl.pc (
-            python -c "from pathlib import Path; p=Path('ffi-prefix').resolve().as_posix(); Path('ffi-prefix/lib/pkgconfig').mkdir(parents=True, exist_ok=True); Path('ffi-prefix/lib/pkgconfig/vpl.pc').write_text('prefix=%s\nexec_prefix=${prefix}\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: vpl\nDescription: Intel VPL\nVersion: 2.17.0\nLibs: -L${libdir} -lvpl\nCflags: -I${includedir}\n' % p, encoding='ascii')"
-          )
+          rem Always rewrite .pc so restored cache works on a new runner workspace path
+          python -c "from pathlib import Path; p=Path('ffi-prefix').resolve().as_posix(); Path('ffi-prefix/lib/pkgconfig').mkdir(parents=True, exist_ok=True); Path('ffi-prefix/lib/pkgconfig/vpl.pc').write_text('prefix=%s\nexec_prefix=${prefix}\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: vpl\nDescription: Intel VPL\nVersion: 2.17.0\nLibs: -L${libdir} -lvpl\nCflags: -I${includedir}\n' % p, encoding='ascii')"
 
           set PKG_CONFIG_PATH=%CD%\ffi-prefix\lib\pkgconfig
           pkg-config --exists --print-errors vpl
@@ -159,14 +149,109 @@ jobs:
           dir ffi-prefix\bin\libvpl.dll
           dir ffi-prefix\lib\vpl.lib
 
-      - name: Prepare shaderc sources
+      - name: Build shaderc with MSVC cl
         run: |
+          call "%VS%\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+          set "PATH=C:\Program Files\NASM;%PATH%"
+          set CC=cl
+          set CXX=cl
+          set CC_LD=
+          set CXX_LD=
+
           if not exist subprojects\shaderc_cmake (
             git clone --depth 1 https://github.com/google/shaderc subprojects\shaderc_cmake
-            git -C subprojects\shaderc_cmake apply --ignore-whitespace ci\ffi\shaderc-glslang.patch
+            git -C subprojects\shaderc_cmake apply --ignore-whitespace "%CD%\ci\ffi\shaderc-glslang.patch"
           )
-          copy /Y ci\ffi\shaderc.meson.build subprojects\shaderc\meson.build
-          copy /Y ci\ffi\spirv-cross.meson.build subprojects\spirv-cross-c-shared\meson.build
+
+          rem Cache hit: libs already in ffi-prefix
+          if exist ffi-prefix\lib\shaderc_combined.lib goto :write_pc
+          if exist ffi-prefix\lib\shaderc.lib goto :write_pc
+
+          python subprojects\shaderc_cmake\utils\git-sync-deps
+          if errorlevel 1 exit /b 1
+          python subprojects\shaderc_cmake\third_party\spirv-tools\utils\update_build_version.py subprojects\shaderc_cmake\third_party\spirv-tools\CHANGES subprojects\shaderc_cmake\third_party\spirv-tools\build-version.inc
+          if errorlevel 1 exit /b 1
+
+          if exist subprojects\shaderc-build rmdir /s /q subprojects\shaderc-build
+          cmake -S subprojects\shaderc_cmake -B subprojects\shaderc-build -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_INSTALL_PREFIX=%CD%\ffi-prefix ^
+            -DCMAKE_INSTALL_LIBDIR=lib ^
+            -DCMAKE_C_COMPILER=cl ^
+            -DCMAKE_CXX_COMPILER=cl ^
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded ^
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW ^
+            -DBUILD_SHARED_LIBS=OFF ^
+            -DSHADERC_SKIP_TESTS=ON ^
+            -DSHADERC_SKIP_EXAMPLES=ON ^
+            -DSHADERC_SKIP_COPYRIGHT_CHECK=ON ^
+            -DENABLE_GLSLANG_BINARIES=OFF ^
+            -DSKIP_GLSLANG_INSTALL=ON ^
+            -DENABLE_SPVREMAPPER=OFF ^
+            -DSPIRV_SKIP_EXECUTABLES=ON ^
+            -DSPIRV_SKIP_TESTS=ON ^
+            -DSPIRV_WERROR=OFF
+          if errorlevel 1 exit /b 1
+          cmake --build subprojects\shaderc-build --config Release
+          if errorlevel 1 exit /b 1
+          cmake --install subprojects\shaderc-build --config Release
+          if errorlevel 1 exit /b 1
+
+          :write_pc
+          python ci\ffi\write-shaderc-pc.py
+          if errorlevel 1 exit /b 1
+          set PKG_CONFIG_PATH=%CD%\ffi-prefix\lib\pkgconfig
+          pkg-config --exists --print-errors shaderc
+          if errorlevel 1 exit /b 1
+          pkg-config --cflags --libs shaderc
+
+      - name: Build spirv-cross with MSVC cl
+        run: |
+          call "%VS%\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+          set CC=cl
+          set CXX=cl
+          set CC_LD=
+          set CXX_LD=
+
+          if not exist subprojects\spirv-cross-src (
+            git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Cross subprojects\spirv-cross-src
+          )
+
+          if exist ffi-prefix\lib\spirv-cross-c.lib goto :write_pc
+
+          if exist subprojects\spirv-cross-build rmdir /s /q subprojects\spirv-cross-build
+          cmake -S subprojects\spirv-cross-src -B subprojects\spirv-cross-build -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_INSTALL_PREFIX=%CD%\ffi-prefix ^
+            -DCMAKE_INSTALL_LIBDIR=lib ^
+            -DCMAKE_C_COMPILER=cl ^
+            -DCMAKE_CXX_COMPILER=cl ^
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded ^
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW ^
+            -DSPIRV_CROSS_SHARED=OFF ^
+            -DSPIRV_CROSS_STATIC=ON ^
+            -DSPIRV_CROSS_CLI=OFF ^
+            -DSPIRV_CROSS_ENABLE_TESTS=OFF ^
+            -DSPIRV_CROSS_ENABLE_MSL=OFF ^
+            -DSPIRV_CROSS_ENABLE_CPP=OFF ^
+            -DSPIRV_CROSS_ENABLE_REFLECT=OFF ^
+            -DSPIRV_CROSS_ENABLE_UTIL=OFF ^
+            -DSPIRV_CROSS_ENABLE_C_API=ON ^
+            -DSPIRV_CROSS_ENABLE_GLSL=ON ^
+            -DSPIRV_CROSS_ENABLE_HLSL=ON
+          if errorlevel 1 exit /b 1
+          cmake --build subprojects\spirv-cross-build --config Release
+          if errorlevel 1 exit /b 1
+          cmake --install subprojects\spirv-cross-build --config Release
+          if errorlevel 1 exit /b 1
+
+          :write_pc
+          python ci\ffi\write-spirv-cross-pc.py
+          if errorlevel 1 exit /b 1
+          set PKG_CONFIG_PATH=%CD%\ffi-prefix\lib\pkgconfig
+          pkg-config --exists --print-errors spirv-cross-c-shared
+          if errorlevel 1 exit /b 1
+          pkg-config --cflags --libs spirv-cross-c-shared
 
       - name: Meson setup and compile libmpv
         id: build
@@ -393,4 +478,5 @@ jobs:
             ffi-prefix
             subprojects/libvpl
             subprojects/shaderc_cmake
+            subprojects/spirv-cross-src
           key: buildffi-x64-${{ steps.get_time.outputs.timestamp }}
