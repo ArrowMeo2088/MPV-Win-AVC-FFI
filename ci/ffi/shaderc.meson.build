@@ -1,0 +1,29 @@
+project('shaderc', 'cpp', version: '2024.1')
+
+python = find_program('python3')
+run_command(python, '../shaderc_cmake/utils/git-sync-deps', check: true)
+run_command(python,
+    '../shaderc_cmake/third_party/spirv-tools/utils/update_build_version.py',
+    '../shaderc_cmake/third_party/spirv-tools/CHANGES',
+    '../shaderc_cmake/third_party/spirv-tools/build-version.inc',
+    check: true)
+
+cmake = import('cmake')
+opts = cmake.subproject_options()
+opts.add_cmake_defines({
+    'CMAKE_MSVC_RUNTIME_LIBRARY': 'MultiThreaded',
+    'CMAKE_POLICY_DEFAULT_CMP0091': 'NEW',
+    'SHADERC_SKIP_INSTALL': 'ON',
+    'SHADERC_SKIP_TESTS': 'ON',
+    'SHADERC_SKIP_EXAMPLES': 'ON',
+    'SHADERC_SKIP_COPYRIGHT_CHECK': 'ON'
+})
+shaderc_proj = cmake.subproject('shaderc_cmake', options: opts)
+shaderc_dep = declare_dependency(dependencies: [
+    shaderc_proj.dependency('shaderc'),
+    shaderc_proj.dependency('shaderc_util'),
+    shaderc_proj.dependency('SPIRV-Tools-static'),
+    shaderc_proj.dependency('SPIRV-Tools-opt'),
+    shaderc_proj.dependency('glslang'),
+])
+meson.override_dependency('shaderc', shaderc_dep)

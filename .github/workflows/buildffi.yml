@@ -1,7 +1,6 @@
 name: buildffi
 
-# Manual cloud build of minimal libmpv-2.dll (VS/MSVC ABI + clang, x64).
-# No push/PR auto trigger.
+# Manual only. All build steps are cmd.exe (no PowerShell build script).
 on:
   workflow_dispatch:
 
@@ -13,15 +12,13 @@ jobs:
   win-x64-msvc:
     runs-on: windows-2025
     env:
-      CC: ccache clang
-      CXX: ccache clang++
-      CC_LD: lld-link
-      CXX_LD: lld-link
-      WINDRES: llvm-rc
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_DIR: ${{ github.workspace }}\.ccache
       CCACHE_MAXSIZE: 2G
       CCACHE_COMPILERCHECK: content
+    defaults:
+      run:
+        shell: cmd
     steps:
       - name: Disable autocrlf
         run: |
@@ -32,9 +29,8 @@ jobs:
 
       - name: Get time
         id: get_time
-        shell: pwsh
         run: |
-          "timestamp=$((Get-Date).Ticks)" >> $env:GITHUB_OUTPUT
+          echo timestamp=%RANDOM%%RANDOM%%TIME: =0%>> %GITHUB_OUTPUT%
 
       - name: Restore caches
         uses: actions/cache/restore@v6
@@ -48,27 +44,72 @@ jobs:
           restore-keys: |
             buildffi-x64-
 
-      - name: Install dependencies
-        shell: pwsh
+      - name: Install tools
         run: |
           python -m pip install --upgrade pip
           python -m pip install meson ninja
           winget install --accept-source-agreements --accept-package-agreements NASM.NASM Ccache.Ccache --disable-interactivity
-          # Real pkg-config binary required by meson-ports FFmpeg (pip pkgconf is not enough)
           choco install pkgconfiglite -y --no-progress
-          echo "$env:LOCALAPPDATA\Microsoft\WinGet\Links" >> $env:GITHUB_PATH
-          echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
-
-      - name: Verify pkg-config
-        shell: pwsh
-        run: |
-          $pc = Get-Command pkg-config -ErrorAction Stop
-          Write-Host "pkg-config: $($pc.Source)"
+          echo %LOCALAPPDATA%\Microsoft\WinGet\Links>> %GITHUB_PATH%
+          echo C:\Program Files\NASM>> %GITHUB_PATH%
+          where pkg-config
           pkg-config --version
+          where meson
+          where ninja
+          where nasm
 
-      - name: Update Meson WrapDB (harfbuzz stack for libass)
-        shell: pwsh
+      - name: Find Visual Studio
         run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
+            echo VS=%%i>> %GITHUB_ENV%
+            echo Found VS=%%i
+            set "VS_FOUND=%%i"
+          )
+          if not defined VS_FOUND (
+            echo ERROR: Visual Studio not found
+            exit /b 1
+          )
+
+      - name: Prepare wraps and dirs
+        run: |
+          if not exist subprojects mkdir subprojects
+          if not exist ffi-prefix mkdir ffi-prefix
+          if not exist ffi-prefix\lib\pkgconfig mkdir ffi-prefix\lib\pkgconfig
+          if not exist ffi-out mkdir ffi-out
+          if not exist subprojects\shaderc mkdir subprojects\shaderc
+          if not exist subprojects\spirv-cross-c-shared mkdir subprojects\spirv-cross-c-shared
+
+          copy /Y ci\ffi\shaderc.meson.build subprojects\shaderc\meson.build
+          copy /Y ci\ffi\spirv-cross.meson.build subprojects\spirv-cross-c-shared\meson.build
+
+          > subprojects\ffmpeg.wrap echo [wrap-git]
+          >> subprojects\ffmpeg.wrap echo url = https://gitlab.freedesktop.org/gstreamer/meson-ports/ffmpeg.git
+          >> subprojects\ffmpeg.wrap echo revision = meson-8.1
+          >> subprojects\ffmpeg.wrap echo depth = 1
+          >> subprojects\ffmpeg.wrap echo clone-recursive = true
+          >> subprojects\ffmpeg.wrap echo [provide]
+          >> subprojects\ffmpeg.wrap echo dependency_names = libavcodec, libavdevice, libavfilter, libavformat, libavutil, libswresample, libswscale
+          >> subprojects\ffmpeg.wrap echo program_names = ffmpeg
+
+          > subprojects\libass.wrap echo [wrap-git]
+          >> subprojects\libass.wrap echo url = https://github.com/libass/libass
+          >> subprojects\libass.wrap echo revision = master
+          >> subprojects\libass.wrap echo depth = 1
+          >> subprojects\libass.wrap echo clone-recursive = true
+
+          > subprojects\libplacebo.wrap echo [wrap-git]
+          >> subprojects\libplacebo.wrap echo url = https://code.videolan.org/videolan/libplacebo.git
+          >> subprojects\libplacebo.wrap echo revision = master
+          >> subprojects\libplacebo.wrap echo depth = 1
+          >> subprojects\libplacebo.wrap echo clone-recursive = true
+
+          > subprojects\spirv-cross.wrap echo [wrap-git]
+          >> subprojects\spirv-cross.wrap echo url = https://github.com/KhronosGroup/SPIRV-Cross
+          >> subprojects\spirv-cross.wrap echo revision = main
+          >> subprojects\spirv-cross.wrap echo depth = 1
+          >> subprojects\spirv-cross.wrap echo clone-recursive = true
+          >> subprojects\spirv-cross.wrap echo method = cmake
+
           meson wrap update-db
           meson wrap install expat
           meson wrap install harfbuzz
@@ -77,73 +118,253 @@ jobs:
           meson wrap install freetype2
           meson wrap install fribidi
 
-      - name: Find Visual Studio
-        shell: pwsh
+      - name: Build libvpl with MSVC cl
         run: |
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          if (-not $vsPath) { throw "Could not find a Visual Studio installation with MSVC" }
-          "VS=$vsPath" | Tee-Object -FilePath $env:GITHUB_ENV -Append
+          call "%VS%\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+          set "PATH=C:\Program Files\NASM;%PATH%"
 
-      - name: Build FFI libmpv
-        id: build
-        shell: pwsh
+          rem Force classic MSVC for libvpl — clang+lld breaks on -Wl,-z,relro
+          set CC=cl
+          set CXX=cl
+          set CC_LD=
+          set CXX_LD=
+          set LD=
+          set LDFLAGS=
+          set CFLAGS=
+          set CXXFLAGS=
+
+          if not exist subprojects\libvpl (
+            git clone --depth 1 --branch v2.17.0 https://github.com/intel/libvpl.git subprojects\libvpl
+          )
+
+          if not exist ffi-prefix\bin\libvpl.dll (
+            if exist subprojects\libvpl-build rmdir /s /q subprojects\libvpl-build
+            mkdir subprojects\libvpl-build
+            cmake -S subprojects\libvpl -B subprojects\libvpl-build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=%CD%\ffi-prefix -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DBUILD_SHARED_LIBS=ON -DBUILD_TOOLS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF
+            if errorlevel 1 exit /b 1
+            cmake --build subprojects\libvpl-build --config Release
+            if errorlevel 1 exit /b 1
+            cmake --install subprojects\libvpl-build --config Release
+            if errorlevel 1 exit /b 1
+          )
+
+          if not exist ffi-prefix\lib\pkgconfig\vpl.pc (
+            python -c "from pathlib import Path; p=Path('ffi-prefix').resolve().as_posix(); Path('ffi-prefix/lib/pkgconfig').mkdir(parents=True, exist_ok=True); Path('ffi-prefix/lib/pkgconfig/vpl.pc').write_text('prefix=%s\nexec_prefix=${prefix}\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: vpl\nDescription: Intel VPL\nVersion: 2.17.0\nLibs: -L${libdir} -lvpl\nCflags: -I${includedir}\n' % p, encoding='ascii')"
+          )
+
+          set PKG_CONFIG_PATH=%CD%\ffi-prefix\lib\pkgconfig
+          pkg-config --exists --print-errors vpl
+          if errorlevel 1 exit /b 1
+          pkg-config --cflags --libs vpl
+          dir ffi-prefix\bin\libvpl.dll
+          dir ffi-prefix\lib\vpl.lib
+
+      - name: Prepare shaderc sources
         run: |
-          # Match upstream win32 CI: drop conflicting toolchains, keep VS LLVM clang
-          $env:PATH = ($env:PATH -split ';' | Where-Object {
-            $_ -ne 'C:\Program Files\LLVM\bin' -and
-            $_ -ne 'C:\Program Files\CMake\bin' -and
-            $_ -ne 'C:\Strawberry\c\bin'
-          }) -join ';'
-          $env:PATH = "C:\Program Files\NASM;$env:PATH"
-          Import-Module "$env:VS\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
-          Enter-VsDevShell -VsInstallPath $env:VS -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64"
-          # Job-level CC/CXX/CC_LD already set; reaffirm after DevShell
-          $env:CC = "ccache clang"
-          $env:CXX = "ccache clang++"
-          $env:CC_LD = "lld-link"
-          $env:CXX_LD = "lld-link"
-          $env:WINDRES = "llvm-rc"
+          if not exist subprojects\shaderc_cmake (
+            git clone --depth 1 https://github.com/google/shaderc subprojects\shaderc_cmake
+            git -C subprojects\shaderc_cmake apply --ignore-whitespace ci\ffi\shaderc-glslang.patch
+          )
+          copy /Y ci\ffi\shaderc.meson.build subprojects\shaderc\meson.build
+          copy /Y ci\ffi\spirv-cross.meson.build subprojects\spirv-cross-c-shared\meson.build
+
+      - name: Meson setup and compile libmpv
+        id: build
+        run: |
+          call "%VS%\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+
+          rem Prefer NASM and ffi-prefix tools; do not force-strip PATH (cmd replace is fragile)
+          set "PATH=C:\Program Files\NASM;%CD%\ffi-prefix\bin;%PATH%"
+
+          rem Upstream-proven Windows toolchain: VS LLVM clang + lld-link
+          set CC=ccache clang
+          set CXX=ccache clang++
+          set CC_LD=lld-link
+          set CXX_LD=lld-link
+          set WINDRES=llvm-rc
+
+          set PKG_CONFIG_PATH=%CD%\ffi-prefix\lib\pkgconfig
+          set CMAKE_PREFIX_PATH=%CD%\ffi-prefix
+          set INCLUDE=%CD%\ffi-prefix\include;%INCLUDE%
+          set LIB=%CD%\ffi-prefix\lib;%LIB%
+
           clang --version
-          pkg-config --version
-          ./ci/build-win32-ffi.ps1
+          pkg-config --exists --print-errors vpl
+          if errorlevel 1 exit /b 1
+
+          if exist build-ffi rmdir /s /q build-ffi
+
+          meson setup build-ffi ^
+            --prefix=%CD%\ffi-prefix ^
+            --libdir=lib ^
+            --wrap-mode=forcefallback ^
+            --default-library=shared ^
+            --buildtype=release ^
+            -Db_vscrt=mt ^
+            -Dlibmpv=true ^
+            -Dcplayer=false ^
+            -Dtests=false ^
+            -Dgpl=true ^
+            -Dd3d11=enabled ^
+            -Dwasapi=enabled ^
+            -Dshaderc=enabled ^
+            -Dspirv-cross=enabled ^
+            -Djavascript=disabled ^
+            -Dlua=disabled ^
+            -Dsubrandr=disabled ^
+            -Dlibarchive=disabled ^
+            -Dvapoursynth=disabled ^
+            -Drubberband=disabled ^
+            -Dlibbluray=disabled ^
+            -Ddvdnav=disabled ^
+            -Dcdda=disabled ^
+            -Duchardet=disabled ^
+            -Dzimg=disabled ^
+            -Djpeg=disabled ^
+            -Dlcms2=disabled ^
+            -Dlibavdevice=disabled ^
+            -Dlibcurl=disabled ^
+            -Dcuda-hwaccel=disabled ^
+            -Dcuda-interop=disabled ^
+            -Dd3d-hwaccel=disabled ^
+            -Dd3d9-hwaccel=disabled ^
+            -Damf=disabled ^
+            -Dvulkan=disabled ^
+            -Dgl=disabled ^
+            -Degl=disabled ^
+            -Degl-angle=disabled ^
+            -Dplain-gl=disabled ^
+            -Dwayland=disabled ^
+            -Dx11=disabled ^
+            -Ddrm=disabled ^
+            -Dvaapi=disabled ^
+            -Dvdpau=disabled ^
+            -Dwin32-smtc=disabled ^
+            -Dlibplacebo:demos=false ^
+            -Dlibplacebo:tests=false ^
+            -Dlibplacebo:vulkan=disabled ^
+            -Dlibplacebo:opengl=disabled ^
+            -Dlibplacebo:d3d11=enabled ^
+            -Dlibplacebo:shaderc=enabled ^
+            -Dlibplacebo:lcms=disabled ^
+            -Dlibass:test=disabled ^
+            -Dharfbuzz:freetype=enabled ^
+            -Dxxhash:inline-all=true ^
+            -Dxxhash:cli=false ^
+            -Dffmpeg:libvpl=enabled ^
+            -Dffmpeg:libdav1d=disabled ^
+            -Dffmpeg:libaom=disabled ^
+            -Dffmpeg:libjxl=disabled ^
+            -Dffmpeg:ffnvcodec=disabled ^
+            -Dffmpeg:vulkan=disabled ^
+            -Dffmpeg:programs=disabled ^
+            -Dffmpeg:tests=disabled ^
+            -Dffmpeg:network=enabled ^
+            -Dffmpeg:gpl=enabled ^
+            -Dffmpeg:h264_qsv_decoder=enabled ^
+            -Dffmpeg:aac_decoder=enabled ^
+            -Dffmpeg:h264_decoder=disabled ^
+            -Dffmpeg:hevc_decoder=disabled ^
+            -Dffmpeg:av1_decoder=disabled ^
+            -Dffmpeg:hevc_qsv_decoder=disabled ^
+            -Dffmpeg:av1_qsv_decoder=disabled ^
+            -Dffmpeg:vp8_qsv_decoder=disabled ^
+            -Dffmpeg:vp9_qsv_decoder=disabled ^
+            -Dffmpeg:mpeg2_qsv_decoder=disabled ^
+            -Dffmpeg:mjpeg_qsv_decoder=disabled ^
+            -Dffmpeg:vc1_qsv_decoder=disabled ^
+            -Dffmpeg:vvc_qsv_decoder=disabled ^
+            -Dffmpeg:h264_cuvid_decoder=disabled ^
+            -Dffmpeg:h264_amf_decoder=disabled ^
+            -Dffmpeg:libdav1d_decoder=disabled ^
+            -Dffmpeg:libaom_av1_decoder=disabled ^
+            -Dffmpeg:h264_qsv_encoder=disabled ^
+            -Dffmpeg:hevc_qsv_encoder=disabled ^
+            -Dffmpeg:av1_qsv_encoder=disabled ^
+            -Dffmpeg:h264_nvenc_encoder=disabled ^
+            -Dffmpeg:h264_amf_encoder=disabled ^
+            -Dffmpeg:h264_parser=enabled ^
+            -Dffmpeg:aac_parser=enabled ^
+            -Dffmpeg:h264_mp4toannexb_bsf=enabled ^
+            -Dffmpeg:aac_adtstoasc_bsf=enabled ^
+            -Dffmpeg:extract_extradata_bsf=enabled ^
+            -Dffmpeg:mov_demuxer=enabled ^
+            -Dffmpeg:mpegts_demuxer=enabled ^
+            -Dffmpeg:dash_demuxer=enabled ^
+            -Dffmpeg:aac_demuxer=enabled ^
+            -Dffmpeg:h264_demuxer=enabled ^
+            -Dffmpeg:file_protocol=enabled ^
+            -Dffmpeg:http_protocol=enabled ^
+            -Dffmpeg:https_protocol=enabled ^
+            -Dffmpeg:tcp_protocol=enabled ^
+            -Dffmpeg:tls_protocol=enabled ^
+            -Dffmpeg:crypto_protocol=enabled ^
+            -Dffmpeg:aresample_filter=enabled ^
+            -Dffmpeg:aformat_filter=enabled ^
+            -Dffmpeg:format_filter=enabled ^
+            -Dffmpeg:scale_filter=enabled ^
+            -Dffmpeg:hwdownload_filter=enabled ^
+            -Dffmpeg:hwupload_filter=enabled ^
+            -Dffmpeg:hwmap_filter=enabled ^
+            -Dffmpeg:h264_d3d11va_hwaccel=disabled ^
+            -Dffmpeg:h264_d3d11va2_hwaccel=disabled ^
+            -Dffmpeg:h264_d3d12va_hwaccel=disabled ^
+            -Dffmpeg:h264_dxva2_hwaccel=disabled ^
+            -Dffmpeg:h264_nvdec_hwaccel=disabled ^
+            -Dffmpeg:h264_vulkan_hwaccel=disabled
+          if errorlevel 1 exit /b 1
+
+          meson compile -C build-ffi libmpv
+          if errorlevel 1 exit /b 1
 
       - name: Print meson log on failure
         if: ${{ failure() && steps.build.outcome == 'failure' }}
-        shell: pwsh
         run: |
-          $log = Get-ChildItem -Recurse -Filter "meson-log.txt" -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match 'build-ffi' } |
-            Select-Object -First 1
-          if ($log) {
-            Write-Host "==== meson-log.txt (tail) ===="
-            Get-Content $log.FullName -Tail 250
-          }
+          if exist build-ffi\meson-logs\meson-log.txt (
+            more +0 build-ffi\meson-logs\meson-log.txt
+          )
 
-      - name: Verify exports
-        shell: pwsh
+      - name: Package artifact
         run: |
-          Import-Module "$env:VS\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
-          Enter-VsDevShell -VsInstallPath $env:VS -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64"
-          $dll = Join-Path $PWD "ffi-out\libmpv-2.dll"
-          if (-not (Test-Path $dll)) { throw "Missing $dll" }
-          $exports = & dumpbin.exe /EXPORTS $dll | Out-String
-          foreach ($sym in @('mpv_create','mpv_initialize','mpv_command','mpv_set_property','mpv_get_property','mpv_wait_event','mpv_terminate_destroy')) {
-            if ($exports -notmatch [regex]::Escape($sym)) {
-              throw "Missing export: $sym"
-            }
-            Write-Host "OK export: $sym"
-          }
-          if (Get-Command ccache -ErrorAction SilentlyContinue) {
-            ccache -s
-          }
+          call "%VS%\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+          if exist ffi-out rmdir /s /q ffi-out
+          mkdir ffi-out
+
+          set FOUND=
+          for /r build-ffi %%f in (mpv-*.dll) do (
+            copy /Y "%%f" ffi-out\libmpv-2.dll
+            set FOUND=1
+            goto :copied
+          )
+          for /r build-ffi %%f in (mpv.dll) do (
+            copy /Y "%%f" ffi-out\libmpv-2.dll
+            set FOUND=1
+            goto :copied
+          )
+          :copied
+          if not exist ffi-out\libmpv-2.dll (
+            echo libmpv DLL not found
+            dir /s /b build-ffi\*.dll
+            exit /b 1
+          )
+
+          if exist ffi-prefix\bin\libvpl.dll copy /Y ffi-prefix\bin\libvpl.dll ffi-out\
+          del /q ffi-out\*.pdb 2>nul
+
+          dumpbin /EXPORTS ffi-out\libmpv-2.dll | findstr /C:"mpv_create" /C:"mpv_initialize" /C:"mpv_command" /C:"mpv_set_property" /C:"mpv_get_property" /C:"mpv_wait_event" /C:"mpv_terminate_destroy"
+          if errorlevel 1 (
+            echo Missing required exports
+            dumpbin /EXPORTS ffi-out\libmpv-2.dll
+            exit /b 1
+          )
+
+          dir ffi-out
+          ccache -s
 
       - name: Artifact name
         id: artifact
-        shell: pwsh
         run: |
-          $name = "libmpv-2-win-x64-msvc-${{ github.run_id }}"
-          "name=$name" >> $env:GITHUB_OUTPUT
+          echo name=libmpv-2-win-x64-msvc-%GITHUB_RUN_ID%>> %GITHUB_OUTPUT%
 
       - uses: actions/upload-artifact@v7
         with:

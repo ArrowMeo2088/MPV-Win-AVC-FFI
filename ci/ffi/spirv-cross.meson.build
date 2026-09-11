@@ -1,0 +1,22 @@
+project('spirv-cross', 'cpp', version: '0.59.0')
+cmake = import('cmake')
+opts = cmake.subproject_options()
+opts.add_cmake_defines({
+    'CMAKE_MSVC_RUNTIME_LIBRARY': 'MultiThreaded',
+    'CMAKE_POLICY_DEFAULT_CMP0091': 'NEW',
+    'SPIRV_CROSS_EXCEPTIONS_TO_ASSERTIONS': 'ON',
+    'SPIRV_CROSS_CLI': 'OFF',
+    'SPIRV_CROSS_ENABLE_TESTS': 'OFF',
+    'SPIRV_CROSS_ENABLE_MSL': 'OFF',
+    'SPIRV_CROSS_ENABLE_CPP': 'OFF',
+    'SPIRV_CROSS_ENABLE_REFLECT': 'OFF',
+    'SPIRV_CROSS_ENABLE_UTIL': 'OFF',
+})
+spirv_cross_proj = cmake.subproject('spirv-cross', options: opts)
+spirv_cross_c_dep = declare_dependency(dependencies: [
+    spirv_cross_proj.dependency('spirv-cross-c'),
+    spirv_cross_proj.dependency('spirv-cross-core'),
+    spirv_cross_proj.dependency('spirv-cross-glsl'),
+    spirv_cross_proj.dependency('spirv-cross-hlsl'),
+])
+meson.override_dependency('spirv-cross-c-shared', spirv_cross_c_dep)

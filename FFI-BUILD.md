@@ -1,71 +1,34 @@
 # MPV-Win-AVC-FFI minimal libmpv build
 
-Cloud-only MSVC build of **`libmpv-2.dll`** for [mpv-kernel](https://github.com/) / Bili.Net.
+Cloud-only build of **`libmpv-2.dll`** for mpv-kernel / Bili.Net.
 
 ## Trigger
 
-```text
-GitHub Actions → buildffi → Run workflow
-```
+GitHub Actions → **buildffi** → Run workflow  
 
-Workflow file: `.github/workflows/buildffi.yml`  
-Build script: `ci/build-win32-ffi.ps1`  
+Workflow: `.github/workflows/buildffi.yml`（**全部 cmd 步骤**，不再使用 PowerShell 构建脚本）
 
-Toolchain: **VS DevShell x64 + clang/lld**（与上游 `win32` CI 相同的 MSVC ABI；纯 `cl` 在 meson-ports FFmpeg 上不可靠）。
+## Toolchain
 
-Push/PR auto builds for the legacy full matrix (`build.yml`, `lint.yml`, …) are **disabled**; those workflows are `workflow_dispatch` only.
+1. **libvpl**：`VsDevCmd` + **MSVC `cl` + Ninja**（避免 clang/lld 吃到 Linux `-z relro`）
+2. **libmpv/FFmpeg/libplacebo**：`VsDevCmd` + **clang / lld-link**（与上游 win32 CI 相同 MSVC ABI）
+3. 依赖：`pkgconfiglite`、`NASM`、`ccache`、`meson`、`ninja`
 
-### Cache
+## Cache
 
-Actions 缓存：`.ccache`、`ffi-prefix`（libvpl）、`subprojects/libvpl`、`subprojects/shaderc_cmake`。
+`.ccache`、`ffi-prefix`、`subprojects/libvpl`、`subprojects/shaderc_cmake`
 
-依赖：`pkgconfiglite`（真实 `pkg-config.exe`）、NASM、ccache、meson、ninja。
-
-## Runtime contract (mpv-kernel)
+## Runtime contract
 
 | Item | Value |
 | --- | --- |
-| DLL | `libmpv-2.dll` (+ `libvpl.dll` dispatcher when present) |
-| API | Standard libmpv client API (`mpv_*` exports) |
-| Video out | `vo=gpu`, `gpu-api=d3d11`, `gpu-context=d3d11` |
-| Decode | `hwdec=no` — FFmpeg **`h264_qsv` only** (no soft `h264`) |
-| Audio | AAC soft decode, WASAPI |
-| Network | HTTP(S) Range via FFmpeg protocols |
-| DASH A/V | Separate URLs via `loadfile` + `audio-file=` |
+| DLL | `libmpv-2.dll` (+ `libvpl.dll`) |
+| API | libmpv client API |
+| VO | `vo=gpu` + d3d11 |
+| Decode | `hwdec=no`，FFmpeg **h264_qsv only** |
+| Audio | AAC soft + WASAPI |
+| Net | HTTP(S) Range；DASH 靠 `audio-file=` |
 
-## FFmpeg (meson-ports) highlights
+## Static wrap helpers
 
-Enabled:
-
-- `libvpl`, `h264_qsv_decoder`, `aac_decoder`
-- demux: `mov`, `mpegts`, `dash`, `aac`, `h264`
-- protocols: `file`, `http`, `https`, `tcp`, `tls`, `crypto`
-- parsers/BSF: `h264`, `aac`, `h264_mp4toannexb`, `aac_adtstoasc`, `extract_extradata`
-- filters: `aresample`, `aformat`, `format`, `scale`, `hwdownload`, `hwupload`, `hwmap`
-
-Disabled (selected):
-
-- soft `h264_decoder`, `hevc_*`, `av1_*`, other `*_qsv` codecs, NVENC/CUVID/AMF paths
-- `ffnvcodec`, FFmpeg `vulkan`, FFmpeg programs
-
-## mpv meson highlights
-
-Enabled: `libmpv`, `d3d11`, `wasapi`, `shaderc`, libplacebo `d3d11`  
-
-Disabled: `cplayer`, `lua`, `javascript`, `cuda-*`, `d3d-hwaccel`, `d3d9-hwaccel`, `amf`, `vulkan`, OpenGL/EGL/ANGLE, dvd/bluray/cdda, etc.
-
-Note: **libass** remains linked (mpv hard dependency for OSD); Bilibili danmaku is still expected to be handled outside mpv.
-
-## Artifact
-
-Upload folder `ffi-out/`:
-
-- `libmpv-2.dll` (renamed from Meson `mpv-*.dll`)
-- `libvpl.dll` / related dispatcher DLLs when produced
-- **no `.pdb`**
-
-## Notes
-
-- Do **not** rely on local compilation; use Actions.
-- Full QSV decode still needs an Intel GPU runtime on the playback machine (dispatcher alone is not enough).
-- Legacy `ci/build-win32.ps1` remains for the optional full `build` workflow and is not the FFI path.
+`ci/ffi/` 下放 shaderc/spirv-cross 的 meson wrap 片段与 patch（非构建脚本）。
